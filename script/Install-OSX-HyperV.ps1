@@ -10,19 +10,18 @@ param(
     [string]$VmName = 'OSX',
 
     [Parameter()]
+    [ValidateSet('15')]
+    [string]$MacOSVersion = '15',
+
+    [Parameter()]
     [switch]$Rollback
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-# OSX-Hyper-V host preparation script.
-# The script is intentionally idempotent: rerunning it after a reboot reuses
-# artifacts already created instead of starting destructive work again.
-# It does not partition, format, or modify a physical Windows disk.
-
 $Drive = $Drive.TrimEnd(':').ToUpperInvariant()
-$RootPath = "${Drive}:\OSX-Hyper-V"
+$RootPath = "${Drive}:\osx2win"
 $RepoPath = Join-Path $RootPath 'OSX-Hyper-V'
 $RecoveryPath = Join-Path $RootPath 'Recovery'
 $VhdPath = Join-Path $RootPath 'VirtualDisks'
@@ -30,35 +29,51 @@ $EfiVhdPath = Join-Path $VhdPath 'EFI.vhdx'
 $OsVhdPath = Join-Path $VhdPath "$VmName.vhdx"
 $LogPath = Join-Path $RootPath 'install.log'
 $RepoUrl = 'https://github.com/Qonfused/OSX-Hyper-V.git'
+$MacRecoveryUrl = 'https://raw.githubusercontent.com/acidanthera/OpenCorePkg/master/Utilities/macrecovery/macrecovery.py'
 $StageTotal = 11
 $Stage = 0
 $StageName = ''
+$StageWatch = [System.Diagnostics.Stopwatch]::new()
 $TranscriptStarted = $false
 $RebootRequired = $false
+$UseAnsiProgress = $true
 
 $CpuCount = 6
 $MemoryBytes = 16GB
 $OsDiskBytes = 160GB
-$EfiDiskBytes = 1GB
+$EfiDiskBytes = 5GB
+
+function Write-ProgressLine([int]$Percent, [string]$Status) {
+    $Percent = [math]::Max(0, [math]::Min(100, $Percent))
+    $completed = [math]::Floor(42 * $Percent / 100)
+    $bar = ('━' * $completed) + ('─' * (42 - $completed))
+    $elapsed = $StageWatch.Elapsed.ToString('mm\:ss')
+    $time = Get-Date -Format 'HH:mm:ss'
+    $line = "{0}  [{1}] {2,3}%  {3}  ({4})" -f $time, $bar, $Percent, $Status, $elapsed
+    if ($script:UseAnsiProgress) {
+        Write-Host ("`r`e[2K{0}" -f $line) -NoNewline
+    }
+    else {
+        $overall = [math]::Round((($script:Stage - 1) * 100 + $Percent) / $StageTotal)
+        Write-Progress -Id 0 -Activity 'OSX-Hyper-V build' -Status "Stage $script:Stage/$StageTotal - $Status" -PercentComplete $overall
+    }
+}
 
 function Write-Stage([string]$Name) {
     $script:Stage++
     $script:StageName = $Name
-    Write-Host ""
-    Write-Host "[$script:Stage/$StageTotal] $Name" -ForegroundColor Cyan
-    Write-Host ('-' * 70) -ForegroundColor DarkGray
-    Update-GlobalProgress 0 "Iniciando stage"
-}
-
-function Update-GlobalProgress([int]$StagePercent, [string]$Status) {
-    $completed = ($script:Stage - 1) * 100
-    $overall = [math]::Round(($completed + [math]::Max(0,[math]::Min(100,$StagePercent))) / $StageTotal)
-    Write-Progress -Id 0 -Activity 'OSX-Hyper-V build' -Status "Stage $script:Stage/$StageTotal - $Status" -PercentComplete $overall
+    $script:StageWatch.Restart()
+    Write-Host ''
+    Write-Host ("[{0}/{1}] {2}" -f $script:Stage, $StageTotal, $Name) -ForegroundColor Cyan
+    Write-ProgressLine 0 'Iniciando'
 }
 
 function Complete-Stage {
-    Update-GlobalProgress 100 'Concluído'
-    Write-Host "  [OK]   $script:StageName" -ForegroundColor Green
+    Write-ProgressLine 100 'Concluído'
+    if ($script:UseAnsiProgress) { Write-Host '' }
+    else { Write-Progress -Id 0 -Activity 'OSX-Hyper-V build' -Status 'Concluído' -PercentComplete ([math]::Round($script:Stage * 100 / $StageTotal)) }
+    Ok $script:StageName
+    $script:StageWatch.Stop()
 }
 
 function Step([string]$Text) { Write-Host "  => $Text" -ForegroundColor Gray }
@@ -66,37 +81,32 @@ function Run([string]$Text) { Write-Host "  [RUN]  $Text" -ForegroundColor White
 function Ok([string]$Text) { Write-Host "  [OK]   $Text" -ForegroundColor Green }
 function Warn([string]$Text) { Write-Host "  [WARN] $Text" -ForegroundColor Yellow }
 function Fail([string]$Text) { Write-Host "  [FAIL] $Text" -ForegroundColor Red }
+function Update-Progress([int]$StagePercent, [string]$Status) { Write-ProgressLine $StagePercent $Status }
 
 function Assert-Administrator {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $p = [Security.Principal.WindowsPrincipal]$id
-    if (-not $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    $principal = [Security.Principal.WindowsPrincipal]$id
+    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
         throw 'Execute o PowerShell como Administrador.'
     }
 }
 
-function Ensure-Directory([string]$Path) {
+function Test-Directory([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path)) {
         New-Item -ItemType Directory -Path $Path -Force | Out-Null
     }
 }
 
-function Command-Exists([string]$Name) {
+function Test-Command([string]$Name) {
     return $null -ne (Get-Command $Name -ErrorAction SilentlyContinue)
 }
 
 function Get-HyperVFeatureState {
-    $output = & dism.exe /Online /Get-FeatureInfo `
-        "/FeatureName:Microsoft-Hyper-V-All" 2>&1
-
-    if ($LASTEXITCODE -ne 0) {
-        return 'Unknown'
-    }
-
+    $output = & dism.exe /Online /Get-FeatureInfo "/FeatureName:Microsoft-Hyper-V-All" 2>&1
+    if ($LASTEXITCODE -ne 0) { return 'Unknown' }
     $text = $output -join "`n"
-
-    if ($text -match "(Enabled|Habilitado|Ativado)") { return 'Enabled' }
-    if ($text -match "(Disabled|Desabilitado|Desativado)") { return 'Disabled' }
+    if ($text -match '(?i)(Enabled|Habilitado|Ativado)') { return 'Enabled' }
+    if ($text -match '(?i)(Disabled|Desabilitado|Desativado)') { return 'Disabled' }
     return 'Unknown'
 }
 
@@ -118,9 +128,6 @@ function Add-CometLakeSpoof([string]$ConfigPath) {
         Ok 'CPUID spoof já está presente em src/config.yml.'
         return
     }
-
-    # OCE-Build accepts repeated top-level sections and merges the patches.
-    # Keep this block separate so the upstream config remains easy to diff.
     $block = @"
 
 ################################################################################
@@ -131,71 +138,180 @@ Kernel:
     Cpuid1Data: Data | <55 06 0A 00 00 00 00 00 00 00 00 00 00 00 00 00>
     Cpuid1Mask: Data | <FF FF FF FF 00 00 00 00 00 00 00 00 00 00 00 00>
 "@
-
     Add-Content -LiteralPath $ConfigPath -Value $block -Encoding UTF8
     Ok 'CPUID spoof Comet Lake adicionado ao src/config.yml.'
 }
 
-function Find-MacRecoveryScript([string]$Repo) {
-    $candidate = Get-ChildItem -LiteralPath $Repo -Filter 'macrecovery.py' -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($candidate) { return $candidate.FullName }
-    return $null
-}
+function Initialize-MacRecoveryTool {
+    $macrecoveryDirectory = Join-Path $RepoPath 'Utilities\macrecovery'
+    $macrecoveryPath = Join-Path $macrecoveryDirectory 'macrecovery.py'
 
-function New-EfiVhd {
-    if (Test-Path -LiteralPath $EfiVhdPath) {
-        Ok "EFI VHDX já existe: $EfiVhdPath"
-        return
+    Test-Directory $macrecoveryDirectory
+
+    $needsDownload = -not (Test-Path -LiteralPath $macrecoveryPath)
+    if (-not $needsDownload) {
+        $file = Get-Item -LiteralPath $macrecoveryPath -ErrorAction SilentlyContinue
+        $needsDownload = $null -eq $file -or $file.Length -lt 1024
     }
 
-    Ensure-Directory $VhdPath
-    Run "New-VHD $EfiVhdPath -Dynamic -SizeBytes 1GB"
-    New-VHD -Path $EfiVhdPath -Dynamic -SizeBytes $EfiDiskBytes | Out-Null
+    if (-not $needsDownload) {
+        Ok "macrecovery.py já está disponível em $macrecoveryPath"
+        return $macrecoveryPath
+    }
 
-    $disk = Mount-VHD -Path $EfiVhdPath -Passthru
+    $temporaryPath = Join-Path $macrecoveryDirectory 'macrecovery.py.download'
+    if (Test-Path -LiteralPath $temporaryPath) { Remove-Item -LiteralPath $temporaryPath -Force }
+
+    Run "Baixando macrecovery.py de $MacRecoveryUrl"
     try {
-        $initialized = Initialize-Disk -Number $disk.Number -PartitionStyle GPT -PassThru -Confirm:$false
-        $partition = $initialized | New-Partition -UseMaximumSize -AssignDriveLetter
-        Format-Volume -Partition $partition -FileSystem FAT32 -NewFileSystemLabel EFI -Confirm:$false | Out-Null
-        $letter = "$($partition.DriveLetter):"
-        $efiSource = Join-Path $RepoPath 'dist\EFI'
-        if (-not (Test-Path -LiteralPath $efiSource)) {
-            throw "Build concluído, mas dist\EFI não foi encontrado em $RepoPath."
+        Invoke-WebRequest -Uri $MacRecoveryUrl -OutFile $temporaryPath -UseBasicParsing
+    }
+    catch {
+        throw "Não foi possível baixar macrecovery.py de $MacRecoveryUrl. $($_.Exception.Message)"
+    }
+
+    $downloaded = Get-Item -LiteralPath $temporaryPath -ErrorAction SilentlyContinue
+    if ($null -eq $downloaded -or $downloaded.Length -lt 1024) {
+        if (Test-Path -LiteralPath $temporaryPath) { Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue }
+        throw 'O download de macrecovery.py terminou com um arquivo ausente ou inválido.'
+    }
+
+    Move-Item -LiteralPath $temporaryPath -Destination $macrecoveryPath -Force
+    Ok "macrecovery.py baixado: $macrecoveryPath"
+    return $macrecoveryPath
+}
+
+function Invoke-MacRecoveryDownload {
+    $recoveryDestination = Join-Path $RecoveryPath 'com.apple.recovery.boot'
+    Test-Directory $recoveryDestination
+
+    $dmg = Get-ChildItem -LiteralPath $recoveryDestination -Filter '*.dmg' -File -ErrorAction SilentlyContinue | Select-Object -First 1
+    $chunklist = Get-ChildItem -LiteralPath $recoveryDestination -Filter '*.chunklist' -File -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($dmg -and $chunklist) {
+        Ok "Recovery já disponível: $($dmg.Name) + $($chunklist.Name)"
+        return $recoveryDestination
+    }
+
+    $macrecoveryPath = Initialize-MacRecoveryTool
+    $recoveryScript = Join-Path $RepoPath 'scripts\lib\create-macos-recovery.ps1'
+    if (-not (Test-Path -LiteralPath $recoveryScript)) { throw "Script de Recovery não encontrado: $recoveryScript" }
+
+    Update-Progress 15 'Baixando macOS Recovery'
+    Run "create-macos-recovery.ps1 -version $MacOSVersion"
+    & $recoveryScript -pwd $RepoPath -macrecovery $macrecoveryPath -version $MacOSVersion -outdir $recoveryDestination
+    if ($LASTEXITCODE -ne 0) { throw "create-macos-recovery.ps1 falhou (exit code $LASTEXITCODE)." }
+    Update-Progress 90 'Validando arquivos do Recovery'
+
+    $dmg = Get-ChildItem -LiteralPath $recoveryDestination -Filter '*.dmg' -File -ErrorAction SilentlyContinue | Select-Object -First 1
+    $chunklist = Get-ChildItem -LiteralPath $recoveryDestination -Filter '*.chunklist' -File -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $dmg -or -not $chunklist) { throw 'O download do Recovery terminou sem BaseSystem.dmg e/ou BaseSystem.chunklist.' }
+
+    Ok "Recovery $MacOSVersion baixado e validado: $([math]::Round($dmg.Length / 1MB,1)) MB"
+    return $recoveryDestination
+}
+
+function Initialize-EfiVhd {
+    Test-Directory $VhdPath
+    if (-not (Test-Path -LiteralPath $EfiVhdPath)) {
+        Run "New-VHD $EfiVhdPath -Dynamic -SizeBytes 5GB"
+        New-VHD -Path $EfiVhdPath -Dynamic -SizeBytes $EfiDiskBytes | Out-Null
+    }
+
+    $vm = Get-Vm $VmName
+    if ($null -ne $vm -and $vm.State -ne 'Off') {
+        throw "A VM '$VmName' está em execução. Desligue-a antes de preparar o EFI VHDX."
+    }
+
+    $attachedEfi = $null
+    if ($null -ne $vm) {
+        $attachedEfi = Get-VMHardDiskDrive -VMName $VmName | Where-Object Path -eq $EfiVhdPath | Select-Object -First 1
+        if ($null -ne $attachedEfi) {
+            Remove-VMHardDiskDrive -VMName $VmName -ControllerType $attachedEfi.ControllerType -ControllerNumber $attachedEfi.ControllerNumber -ControllerLocation $attachedEfi.ControllerLocation
+            Ok 'EFI VHDX temporariamente desconectado da VM para atualização.'
         }
-        Copy-Item -LiteralPath $efiSource -Destination (Join-Path $letter 'EFI') -Recurse -Force
+    }
+
+    $vhd = Get-VHD -Path $EfiVhdPath
+    if ($vhd.Size -lt $EfiDiskBytes) {
+        Run "Resize-VHD $EfiVhdPath para 5GB"
+        Resize-VHD -Path $EfiVhdPath -SizeBytes $EfiDiskBytes
+    }
+
+    $mounted = $false
+    try {
+        $disk = Mount-VHD -Path $EfiVhdPath -Passthru
+        $mounted = $true
+        $disk = Get-Disk -Number $disk.Number
+        if ($disk.PartitionStyle -eq 'RAW') {
+            Initialize-Disk -Number $disk.Number -PartitionStyle GPT -Confirm:$false | Out-Null
+            $partition = New-Partition -DiskNumber $disk.Number -UseMaximumSize -AssignDriveLetter
+            Format-Volume -Partition $partition -FileSystem FAT32 -NewFileSystemLabel EFI -Confirm:$false -Force | Out-Null
+        }
+        else {
+            $partition = Get-Partition -DiskNumber $disk.Number | Where-Object { $_.Type -eq 'Basic' -or $_.FileSystem -eq 'FAT32' } | Select-Object -First 1
+            if ($null -eq $partition) { throw 'Não foi encontrada uma partição utilizável no EFI VHDX.' }
+            if (-not $partition.DriveLetter) { $partition | Add-PartitionAccessPath -AssignDriveLetter | Out-Null }
+            $partition = Get-Partition -DiskNumber $disk.Number | Where-Object { $_.PartitionNumber -eq $partition.PartitionNumber }
+            $supported = Get-PartitionSupportedSize -DiskNumber $disk.Number -PartitionNumber $partition.PartitionNumber
+            if ($supported.SizeMax -gt $partition.Size) { Resize-Partition -DiskNumber $disk.Number -PartitionNumber $partition.PartitionNumber -Size $supported.SizeMax }
+        }
+
+        $mountRoot = "$($partition.DriveLetter):"
+        $efiSource = Join-Path $RepoPath 'dist\EFI'
+        if (-not (Test-Path -LiteralPath $efiSource)) { throw "Build concluído, mas dist\EFI não foi encontrado em $RepoPath." }
+        Test-Directory (Join-Path $mountRoot 'EFI')
+        Copy-Item -Path (Join-Path $efiSource '*') -Destination (Join-Path $mountRoot 'EFI') -Recurse -Force
 
         $toolsSource = Join-Path $RepoPath 'dist\Tools'
         if (Test-Path -LiteralPath $toolsSource) {
-            Copy-Item -LiteralPath $toolsSource -Destination (Join-Path $letter 'Tools') -Recurse -Force
+            Test-Directory (Join-Path $mountRoot 'Tools')
+            Copy-Item -Path (Join-Path $toolsSource '*') -Destination (Join-Path $mountRoot 'Tools') -Recurse -Force
         }
+
+        $scriptsSource = Join-Path $RepoPath 'dist\Scripts'
+        if (Test-Path -LiteralPath $scriptsSource) {
+            Test-Directory (Join-Path $mountRoot 'Scripts')
+            Copy-Item -Path (Join-Path $scriptsSource '*') -Destination (Join-Path $mountRoot 'Scripts') -Recurse -Force
+        }
+
+        $recoverySource = Join-Path $RecoveryPath 'com.apple.recovery.boot'
+        if (-not (Test-Path -LiteralPath $recoverySource)) { throw "Recovery não encontrado em $recoverySource." }
+        $recoveryTarget = Join-Path $mountRoot 'com.apple.recovery.boot'
+        Test-Directory $recoveryTarget
+        Copy-Item -Path (Join-Path $recoverySource '*') -Destination $recoveryTarget -Recurse -Force
+
+        $files = Get-ChildItem -LiteralPath $recoveryTarget -File
+        $dmg = $files | Where-Object Extension -ieq '.dmg' | Select-Object -First 1
+        $chunklist = $files | Where-Object Extension -ieq '.chunklist' | Select-Object -First 1
+        if (-not $dmg -or -not $chunklist) { throw 'EFI VHDX preparado sem os arquivos de Recovery esperados.' }
+
+        Ok "EFI VHDX preparado com EFI + Recovery ($([math]::Round(($dmg.Length + $chunklist.Length) / 1MB,1)) MB)"
     }
     finally {
-        Dismount-VHD -Path $EfiVhdPath -ErrorAction SilentlyContinue
+        if ($mounted) { Dismount-VHD -Path $EfiVhdPath -ErrorAction SilentlyContinue }
+        if ($null -ne $attachedEfi) {
+            Add-VMHardDiskDrive -VMName $VmName -Path $EfiVhdPath -ControllerType $attachedEfi.ControllerType -ControllerNumber $attachedEfi.ControllerNumber -ControllerLocation $attachedEfi.ControllerLocation
+            Ok 'EFI VHDX reconectado à VM.'
+        }
     }
 
-    Ok "EFI VHDX criado: $EfiVhdPath"
+    Optimize-VHD -Path $EfiVhdPath -Mode Full -ErrorAction SilentlyContinue
 }
 
-function New-OsVhd {
-    if (Test-Path -LiteralPath $OsVhdPath) {
-        Ok "Disco da VM já existe: $OsVhdPath"
-        return
-    }
-
-    Ensure-Directory $VhdPath
+function Initialize-OsVhd {
+    Test-Directory $VhdPath
+    if (Test-Path -LiteralPath $OsVhdPath) { Ok "Disco da VM já existe: $OsVhdPath"; return }
     Run "New-VHD $OsVhdPath -Dynamic -SizeBytes 160GB"
     New-VHD -Path $OsVhdPath -Dynamic -SizeBytes $OsDiskBytes | Out-Null
     Ok "Disco principal criado: $OsVhdPath"
 }
 
-function Configure-Vm {
+function Initialize-Vm {
     $vm = Get-Vm $VmName
     if ($null -eq $vm) {
         $switch = Get-VMSwitch | Where-Object { $_.SwitchType -eq 'External' } | Select-Object -First 1
         if ($null -eq $switch) { $switch = Get-VMSwitch | Select-Object -First 1 }
         if ($null -eq $switch) { throw 'Nenhum Virtual Switch Hyper-V foi encontrado.' }
-
-        Run "New-VM $VmName (Generation 2)"
         New-VM -Name $VmName -Generation 2 -MemoryStartupBytes $MemoryBytes -NoVHD | Out-Null
         $adapter = Get-VMNetworkAdapter -VMName $VmName | Select-Object -First 1
         Connect-VMNetworkAdapter -VMName $VmName -Name $adapter.Name -SwitchName $switch.Name
@@ -203,41 +319,33 @@ function Configure-Vm {
         Add-VMHardDiskDrive -VMName $VmName -Path $OsVhdPath -ControllerType SCSI -ControllerNumber 0 -ControllerLocation 1
         Set-VM -Name $VmName -ProcessorCount $CpuCount -MemoryStartupBytes $MemoryBytes -AutomaticCheckpointsEnabled $false
         Set-VMFirmware -VMName $VmName -EnableSecureBoot Off
-        $efiDisk = Get-VMHardDiskDrive -VMName $VmName | Where-Object { $_.Path -eq $EfiVhdPath }
+        $efiDisk = Get-VMHardDiskDrive -VMName $VmName | Where-Object Path -eq $EfiVhdPath
         Set-VMFirmware -VMName $VmName -FirstBootDevice $efiDisk
         Ok "VM '$VmName' criada e configurada."
         return
     }
 
+    if ($vm.State -ne 'Off') { throw "A VM '$VmName' precisa estar desligada para ser reconfigurada." }
     Warn "VM '$VmName' já existe; nenhuma VM foi removida ou recriada."
     $vmDisks = Get-VMHardDiskDrive -VMName $VmName
-    if (-not ($vmDisks | Where-Object Path -eq $EfiVhdPath)) {
-        Add-VMHardDiskDrive -VMName $VmName -Path $EfiVhdPath -ControllerType SCSI -ControllerNumber 0 -ControllerLocation 0
-        Ok 'EFI VHDX conectado à VM existente.'
-    }
-    if (-not ($vmDisks | Where-Object Path -eq $OsVhdPath)) {
-        Add-VMHardDiskDrive -VMName $VmName -Path $OsVhdPath -ControllerType SCSI -ControllerNumber 0 -ControllerLocation 1
-        Ok 'OS VHDX conectado à VM existente.'
-    }
+    if (-not ($vmDisks | Where-Object Path -eq $EfiVhdPath)) { Add-VMHardDiskDrive -VMName $VmName -Path $EfiVhdPath -ControllerType SCSI -ControllerNumber 0 -ControllerLocation 0 }
+    if (-not ($vmDisks | Where-Object Path -eq $OsVhdPath)) { Add-VMHardDiskDrive -VMName $VmName -Path $OsVhdPath -ControllerType SCSI -ControllerNumber 0 -ControllerLocation 1 }
     Set-VM -Name $VmName -ProcessorCount $CpuCount -MemoryStartupBytes $MemoryBytes -AutomaticCheckpointsEnabled $false
     Set-VMFirmware -VMName $VmName -EnableSecureBoot Off
+    $efiDisk = Get-VMHardDiskDrive -VMName $VmName | Where-Object Path -eq $EfiVhdPath
+    Set-VMFirmware -VMName $VmName -FirstBootDevice $efiDisk
 }
 
 function Invoke-Rollback {
     Write-Host ''
     Write-Host 'ROLLBACK' -ForegroundColor Yellow
-    Write-Host ('=' * 70) -ForegroundColor DarkGray
     $vm = Get-Vm $VmName
     if ($null -ne $vm) {
         if ($vm.State -ne 'Off') { Stop-VM -Name $VmName -Force -ErrorAction SilentlyContinue }
         Remove-VM -Name $VmName -Force
         Ok "VM '$VmName' removida."
-    } else { Step "VM '$VmName' não existe." }
-
-    if (Test-Path -LiteralPath $RootPath) {
-        Remove-Item -LiteralPath $RootPath -Recurse -Force
-        Ok "Workspace removido: $RootPath"
-    } else { Step 'Workspace não existe.' }
+    }
+    if (Test-Path -LiteralPath $RootPath) { Remove-Item -LiteralPath $RootPath -Recurse -Force; Ok "Workspace removido: $RootPath" }
 }
 
 try {
@@ -246,19 +354,20 @@ try {
     Write-Host ''
     Write-Host 'OSX-Hyper-V / macOS Sequoia' -ForegroundColor Cyan
     Write-Host 'Hyper-V Development Host' -ForegroundColor DarkGray
-    Write-Host ''
     Write-Host ('=' * 70) -ForegroundColor DarkGray
     Write-Host "Workspace : $RootPath"
     Write-Host "VM        : $VmName"
     Write-Host "CPU       : $CpuCount vCPU"
     Write-Host 'RAM       : 16 GB'
     Write-Host 'OS Disk   : 160 GB dynamic'
+    Write-Host 'EFI Disk  : 5 GB dynamic (EFI + macOS Recovery)'
 
-    Ensure-Directory $RootPath
+    Test-Directory $RootPath
     Start-Transcript -Path $LogPath -Append -ErrorAction SilentlyContinue | Out-Null
     $TranscriptStarted = $true
 
-    # 1
+    if ($env:TERM -eq 'dumb' -or $Host.Name -match 'ISE') { $script:UseAnsiProgress = $false }
+
     Write-Stage 'Validando host Windows'
     Assert-Administrator
     $os = Get-CimInstance Win32_OperatingSystem
@@ -269,11 +378,12 @@ try {
     Step "Threads : $($cpu.NumberOfLogicalProcessors)"
     Step "RAM     : $([math]::Round($os.TotalVisibleMemorySize / 1MB,2)) GB"
     if (-not (Test-Path -LiteralPath "${Drive}:\")) { throw "A unidade ${Drive}: não existe." }
+    if (-not (Test-Command 'dism.exe')) { throw 'DISM.exe não foi encontrado.' }
+    if (-not (Test-Command 'git')) { throw 'Git não está disponível no PATH.' }
     Ok "Unidade ${Drive}: disponível."
-    if (-not (Command-Exists 'dism.exe')) { throw 'DISM.exe não foi encontrado.' }
+    Ok 'Git e DISM disponíveis.'
     Complete-Stage
 
-    # 2
     Write-Stage 'Validando / habilitando Hyper-V'
     $state = Get-HyperVFeatureState
     Step "Estado Microsoft-Hyper-V-All: $state"
@@ -283,37 +393,24 @@ try {
     if (-not (Get-Module -ListAvailable -Name Hyper-V)) { throw 'Módulo PowerShell Hyper-V não está disponível.' }
     Ok 'Módulo Hyper-V disponível.'
     Complete-Stage
-    if ($RebootRequired) {
-        Write-Host ''
-        Warn 'Reinicialize o Windows antes de continuar.'
-        Warn 'O script é idempotente: após o reboot, execute o mesmo comando novamente.'
-        throw 'Reinicialização necessária para concluir a ativação do Hyper-V.'
-    }
+    if ($RebootRequired) { Warn 'Reinicialize o Windows e execute novamente o mesmo comando.'; throw 'Reinicialização necessária para concluir a ativação do Hyper-V.' }
 
-    # 3
     Write-Stage 'Preparando workspace'
-    Ensure-Directory $RepoPath
-    Ensure-Directory $RecoveryPath
-    Ensure-Directory $VhdPath
+    Test-Directory $RepoPath
+    Test-Directory $RecoveryPath
+    Test-Directory $VhdPath
     Ok "Workspace pronto em $RootPath"
     Complete-Stage
 
-    # 4
     Write-Stage 'Obtendo OSX-Hyper-V'
     if (Test-Path -LiteralPath (Join-Path $RepoPath '.git')) {
         Push-Location $RepoPath
-        try {
-            Run 'git pull --ff-only'
-            git pull --ff-only
-            if ($LASTEXITCODE -ne 0) { throw 'git pull falhou.' }
-        } finally { Pop-Location }
+        try { git pull --ff-only; if ($LASTEXITCODE -ne 0) { throw 'git pull falhou.' } }
+        finally { Pop-Location }
         Ok 'Repositório atualizado.'
-    } else {
-        # Remove only the empty directory created above if needed; never delete
-        # a non-git directory supplied by the user.
-        if ((Get-ChildItem -LiteralPath $RepoPath -Force | Measure-Object).Count -gt 0) {
-            throw "$RepoPath existe mas não é um clone Git do OSX-Hyper-V. Não será removido automaticamente."
-        }
+    }
+    else {
+        if ((Get-ChildItem -LiteralPath $RepoPath -Force | Measure-Object).Count -gt 0) { throw "$RepoPath existe mas não é um clone Git do OSX-Hyper-V. Não será removido automaticamente." }
         Run "git clone $RepoUrl $RepoPath"
         git clone $RepoUrl $RepoPath
         if ($LASTEXITCODE -ne 0) { throw 'git clone falhou.' }
@@ -321,119 +418,68 @@ try {
     }
     Complete-Stage
 
-    # 5
     Write-Stage 'Validando ferramentas'
-    if (-not (Command-Exists 'git')) { throw 'Git não está disponível no PATH.' }
-    Ok 'Git disponível.'
-    if (Command-Exists 'python') { Ok 'Python disponível.' }
-    elseif (Command-Exists 'py') { Ok 'Python Launcher (py) disponível.' }
-    else {
-        Warn 'Python não encontrado. O build do OSX-Hyper-V/OCE-Build será responsável pela ferramenta necessária quando possível.'
-    }
+    $macrecoveryPath = Initialize-MacRecoveryTool
+    Ok "macrecovery.py disponível em $macrecoveryPath"
     Complete-Stage
 
-    # 6
     Write-Stage 'Configurando CPU / src/config.yml'
     $configPath = Join-Path $RepoPath 'src\config.yml'
     if (-not (Test-Path -LiteralPath $configPath)) { throw "Arquivo correto do projeto não encontrado: $configPath" }
-    Step "Configuração: $configPath"
     Add-CometLakeSpoof $configPath
     Complete-Stage
 
-    # 7
     Write-Stage 'Construindo OpenCore / EFI'
     $buildScript = Join-Path $RepoPath 'scripts\build.ps1'
     if (-not (Test-Path -LiteralPath $buildScript)) { throw "Build script não encontrado: $buildScript" }
     $efiDir = Join-Path $RepoPath 'dist\EFI'
-    if (Test-Path -LiteralPath $efiDir) {
-        Ok 'dist\EFI já existe; build será reutilizado.'
-    } else {
-        Run 'scripts\build.ps1'
-        & $buildScript
-        if ($LASTEXITCODE -ne 0) { throw "build.ps1 falhou (exit code $LASTEXITCODE)." }
-        Ok 'OpenCore/EFI construído.'
-    }
+    if (Test-Path -LiteralPath $efiDir) { Ok 'dist\EFI já existe; build será reutilizado.' }
+    else { Run 'scripts\build.ps1'; & $buildScript; if ($LASTEXITCODE -ne 0) { throw "build.ps1 falhou (exit code $LASTEXITCODE)." }; Ok 'OpenCore/EFI construído.' }
     Complete-Stage
 
-    # 8
-    Write-Stage 'Preparando macOS Sequoia Recovery'
-    $recoveryDestination = Join-Path $RepoPath 'com.apple.recovery.boot'
-    if (Test-Path -LiteralPath $recoveryDestination) {
-        Ok 'Recovery já existe no repositório de build.'
-    } else {
-        $recoveryScript = Join-Path $RepoPath 'scripts\lib\create-macos-recovery.ps1'
-        if (-not (Test-Path -LiteralPath $recoveryScript)) { throw "Script de Recovery não encontrado: $recoveryScript" }
-        $macrecovery = Find-MacRecoveryScript $RepoPath
-        if ($null -eq $macrecovery) {
-            $ocPath = Join-Path $RootPath 'OpenCorePkg'
-            if (-not (Test-Path -LiteralPath (Join-Path $ocPath '.git'))) {
-                Run "git clone --depth 1 https://github.com/acidanthera/OpenCorePkg.git $ocPath"
-                git clone --depth 1 'https://github.com/acidanthera/OpenCorePkg.git' $ocPath
-                if ($LASTEXITCODE -ne 0) { throw 'Falha ao obter OpenCorePkg.' }
-            }
-            $macrecovery = Find-MacRecoveryScript $ocPath
-        }
-        if ($null -eq $macrecovery) { throw 'macrecovery.py não foi encontrado.' }
-        Ensure-Directory $recoveryDestination
-        if (Command-Exists 'python') { $py = 'python' } elseif (Command-Exists 'py') { $py = 'py' } else { throw 'Python é necessário para executar macrecovery.py.' }
-        Push-Location $RepoPath
-        try {
-            Run "$py macrecovery.py -b Mac-7BA5B2D9E42DDD94 -m 00000000000000000 -o $recoveryDestination download"
-            & $py $macrecovery -b 'Mac-7BA5B2D9E42DDD94' -m '00000000000000000' -o $recoveryDestination download
-            if ($LASTEXITCODE -ne 0) { throw "macrecovery.py falhou (exit code $LASTEXITCODE)." }
-        } finally { Pop-Location }
-        Ok 'macOS Sequoia Recovery preparado.'
-    }
+    Write-Stage 'Baixando macOS Sequoia Recovery'
+    $recoveryDestination = Invoke-MacRecoveryDownload
+    Step "Staging: $recoveryDestination"
     Complete-Stage
 
-    # 9
-    Write-Stage 'Criando EFI.vhdx'
-    New-EfiVhd
+    Write-Stage 'Preparando EFI.vhdx (EFI + Recovery)'
+    Initialize-EfiVhd
     Complete-Stage
 
-    # 10
     Write-Stage 'Criando disco principal da VM'
-    New-OsVhd
+    Initialize-OsVhd
     Complete-Stage
 
-    # 11
     Write-Stage 'Criando / configurando VM Hyper-V'
-    Configure-Vm
+    Initialize-Vm
     Complete-Stage
 
-    Write-Progress -Id 0 -Activity 'OSX-Hyper-V build' -Status 'BUILD COMPLETE' -PercentComplete 100
+    if (-not $script:UseAnsiProgress) { Write-Progress -Id 0 -Activity 'OSX-Hyper-V build' -Completed }
+    elseif ($script:Stage -gt 0) { Write-ProgressLine 100 'BUILD COMPLETE'; Write-Host '' }
     Write-Host ''
     Write-Host ('=' * 70) -ForegroundColor Green
     Write-Host 'BUILD COMPLETE' -ForegroundColor Green
     Write-Host ('=' * 70) -ForegroundColor Green
-    Write-Host ''
     Ok "VM: $VmName"
-    Ok "Workspace: $RootPath"
-    Ok "EFI: $EfiVhdPath"
+    Ok "EFI + Recovery: $EfiVhdPath"
     Ok "OS disk: $OsVhdPath"
     Write-Host ''
-    Step 'Próximo passo: iniciar a VM no Hyper-V Manager e executar a instalação interativa do macOS.'
-    Step 'Depois da instalação, configurar SSH no macOS para Pair to Mac / Visual Studio.'
+    Step 'A VM está pronta para iniciar o OpenCore e carregar o macOS Recovery.'
+    Step 'No OpenCore, a entrada do Recovery deve aparecer como EFI/macOS Base System.'
+    Step 'Após instalar o macOS, configure SSH/Remote Login para Pair to Mac.'
 }
 catch {
-    Write-Progress -Id 0 -Activity 'OSX-Hyper-V build' -Completed
+    if ($script:UseAnsiProgress) { Write-Host '' } else { Write-Progress -Id 0 -Activity 'OSX-Hyper-V build' -Completed }
     Write-Host ''
     Write-Host ('=' * 70) -ForegroundColor Red
     Fail 'BUILD FAILED'
-    Write-Host ''
     Write-Host "Stage : $Stage/$StageTotal" -ForegroundColor Yellow
     Write-Host "Stage : $StageName" -ForegroundColor Yellow
     Write-Host "Erro  : $($_.Exception.Message)" -ForegroundColor Red
     Write-Host ''
     Write-Host "Estado preservado em: $RootPath" -ForegroundColor Yellow
-    Write-Host ''
-    if ($RebootRequired) {
-        Write-Host 'REINICIALIZAÇÃO NECESSÁRIA' -ForegroundColor Yellow
-        Write-Host 'Após reiniciar, execute novamente o mesmo comando. Os stages anteriores serão reutilizados.' -ForegroundColor Yellow
-    }
-    Write-Host ''
-    Write-Host 'Rollback:' -ForegroundColor Yellow
-    Write-Host ".\Install-OSX-HyperV.ps1 -Drive $Drive -VmName `"$VmName`" -Rollback" -ForegroundColor White
+    Write-Host "Rollback: .\Install-OSX-HyperV.ps1 -Drive $Drive -VmName `"$VmName`" -Rollback" -ForegroundColor White
+    if ($RebootRequired) { Write-Host 'REINICIALIZAÇÃO NECESSÁRIA: execute novamente após o reboot.' -ForegroundColor Yellow }
     exit 1
 }
 finally {
