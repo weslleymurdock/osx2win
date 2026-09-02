@@ -86,11 +86,17 @@ function Command-Exists([string]$Name) {
 }
 
 function Get-HyperVFeatureState {
-    $output = & dism.exe /Online /Get-FeatureInfo /FeatureName:Microsoft-Hyper-V-All 2>&1
-    if ($LASTEXITCODE -ne 0) { return 'Unknown' }
+    $output = & dism.exe /Online /Get-FeatureInfo `
+        "/FeatureName:Microsoft-Hyper-V-All" 2>&1
+
+    if ($LASTEXITCODE -ne 0) {
+        return 'Unknown'
+    }
+
     $text = $output -join "`n"
-    if ($text -match '(?im)^\s*State\s*:\s*Enabled\s*$') { return 'Enabled' }
-    if ($text -match '(?im)^\s*State\s*:\s*Disabled\s*$') { return 'Disabled' }
+
+    if ($text -match "(Enabled|Habilitado|Ativado)") { return 'Enabled' }
+    if ($text -match "(Disabled|Desabilitado|Desativado)") { return 'Disabled' }
     return 'Unknown'
 }
 
