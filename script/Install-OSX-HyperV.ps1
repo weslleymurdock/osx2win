@@ -21,7 +21,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $Drive = $Drive.TrimEnd(':').ToUpperInvariant()
-$RootPath = "${Drive}:\OSX-Hyper-V"
+$RootPath = "${Drive}:\osx2win"
 $RepoPath = Join-Path $RootPath 'OSX-Hyper-V'
 $RecoveryPath = Join-Path $RootPath 'Recovery'
 $VhdPath = Join-Path $RootPath 'VirtualDisks'
@@ -29,6 +29,7 @@ $EfiVhdPath = Join-Path $VhdPath 'EFI.vhdx'
 $OsVhdPath = Join-Path $VhdPath "$VmName.vhdx"
 $LogPath = Join-Path $RootPath 'install.log'
 $RepoUrl = 'https://github.com/Qonfused/OSX-Hyper-V.git'
+$MacRecoveryUrl = 'https://raw.githubusercontent.com/acidanthera/OpenCorePkg/master/Utilities/macrecovery/macrecovery.py'
 $StageTotal = 11
 $Stage = 0
 $StageName = ''
@@ -40,8 +41,6 @@ $UseAnsiProgress = $true
 $CpuCount = 6
 $MemoryBytes = 16GB
 $OsDiskBytes = 160GB
-# 5 GB follows the current upstream VM helper and leaves enough room for
-# modern Recovery images while retaining a small EFI disk.
 $EfiDiskBytes = 5GB
 
 function Write-ProgressLine([int]$Percent, [string]$Status) {
@@ -51,7 +50,6 @@ function Write-ProgressLine([int]$Percent, [string]$Status) {
     $elapsed = $StageWatch.Elapsed.ToString('mm\:ss')
     $time = Get-Date -Format 'HH:mm:ss'
     $line = "{0}  [{1}] {2,3}%  {3}  ({4})" -f $time, $bar, $Percent, $Status, $elapsed
-
     if ($script:UseAnsiProgress) {
         Write-Host ("`r`e[2K{0}" -f $line) -NoNewline
     }
@@ -94,10 +92,14 @@ function Assert-Administrator {
 }
 
 function Test-Directory([string]$Path) {
-    if (-not (Test-Path -LiteralPath $Path)) { New-Item -ItemType Directory -Path $Path -Force | Out-Null }
+    if (-not (Test-Path -LiteralPath $Path)) {
+        New-Item -ItemType Directory -Path $Path -Force | Out-Null
+    }
 }
 
-function Test-Command([string]$Name) { return $null -ne (Get-Command $Name -ErrorAction SilentlyContinue) }
+function Test-Command([string]$Name) {
+    return $null -ne (Get-Command $Name -ErrorAction SilentlyContinue)
+}
 
 function Get-HyperVFeatureState {
     $output = & dism.exe /Online /Get-FeatureInfo "/FeatureName:Microsoft-Hyper-V-All" 2>&1
@@ -122,7 +124,10 @@ function Get-Vm([string]$Name) {
 
 function Add-CometLakeSpoof([string]$ConfigPath) {
     $content = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8
-    if ($content -match '(?m)Cpuid1Data\s*:') { Ok 'CPUID spoof já está presente em src/config.yml.'; return }
+    if ($content -match '(?m)Cpuid1Data\s*:') {
+        Ok 'CPUID spoof já está presente em src/config.yml.'
+        return
+    }
     $block = @"
 
 ################################################################################
@@ -137,6 +142,45 @@ Kernel:
     Ok 'CPUID spoof Comet Lake adicionado ao src/config.yml.'
 }
 
+function Initialize-MacRecoveryTool {
+    $macrecoveryDirectory = Join-Path $RepoPath 'Utilities\macrecovery'
+    $macrecoveryPath = Join-Path $macrecoveryDirectory 'macrecovery.py'
+
+    Test-Directory $macrecoveryDirectory
+
+    $needsDownload = -not (Test-Path -LiteralPath $macrecoveryPath)
+    if (-not $needsDownload) {
+        $file = Get-Item -LiteralPath $macrecoveryPath -ErrorAction SilentlyContinue
+        $needsDownload = $null -eq $file -or $file.Length -lt 1024
+    }
+
+    if (-not $needsDownload) {
+        Ok "macrecovery.py já está disponível em $macrecoveryPath"
+        return $macrecoveryPath
+    }
+
+    $temporaryPath = Join-Path $macrecoveryDirectory 'macrecovery.py.download'
+    if (Test-Path -LiteralPath $temporaryPath) { Remove-Item -LiteralPath $temporaryPath -Force }
+
+    Run "Baixando macrecovery.py de $MacRecoveryUrl"
+    try {
+        Invoke-WebRequest -Uri $MacRecoveryUrl -OutFile $temporaryPath -UseBasicParsing
+    }
+    catch {
+        throw "Não foi possível baixar macrecovery.py de $MacRecoveryUrl. $($_.Exception.Message)"
+    }
+
+    $downloaded = Get-Item -LiteralPath $temporaryPath -ErrorAction SilentlyContinue
+    if ($null -eq $downloaded -or $downloaded.Length -lt 1024) {
+        if (Test-Path -LiteralPath $temporaryPath) { Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue }
+        throw 'O download de macrecovery.py terminou com um arquivo ausente ou inválido.'
+    }
+
+    Move-Item -LiteralPath $temporaryPath -Destination $macrecoveryPath -Force
+    Ok "macrecovery.py baixado: $macrecoveryPath"
+    return $macrecoveryPath
+}
+
 function Invoke-MacRecoveryDownload {
     $recoveryDestination = Join-Path $RecoveryPath 'com.apple.recovery.boot'
     Test-Directory $recoveryDestination
@@ -148,14 +192,13 @@ function Invoke-MacRecoveryDownload {
         return $recoveryDestination
     }
 
-    # Reuse the upstream recovery wrapper. It invokes OCE-Build's bootstrap
-    # and therefore does not require a separately installed Python runtime.
+    $macrecoveryPath = Initialize-MacRecoveryTool
     $recoveryScript = Join-Path $RepoPath 'scripts\lib\create-macos-recovery.ps1'
     if (-not (Test-Path -LiteralPath $recoveryScript)) { throw "Script de Recovery não encontrado: $recoveryScript" }
 
-    Update-Progress 10 'Baixando macOS Recovery'
+    Update-Progress 15 'Baixando macOS Recovery'
     Run "create-macos-recovery.ps1 -version $MacOSVersion"
-    & $recoveryScript -pwd $RepoPath -version $MacOSVersion -outdir $recoveryDestination
+    & $recoveryScript -pwd $RepoPath -macrecovery $macrecoveryPath -version $MacOSVersion -outdir $recoveryDestination
     if ($LASTEXITCODE -ne 0) { throw "create-macos-recovery.ps1 falhou (exit code $LASTEXITCODE)." }
     Update-Progress 90 'Validando arquivos do Recovery'
 
@@ -179,8 +222,6 @@ function Initialize-EfiVhd {
         throw "A VM '$VmName' está em execução. Desligue-a antes de preparar o EFI VHDX."
     }
 
-    # An attached VHDX may not be mountable by the host. Temporarily detach it
-    # from an existing, powered-off VM and restore the original controller slot.
     $attachedEfi = $null
     if ($null -ne $vm) {
         $attachedEfi = Get-VMHardDiskDrive -VMName $VmName | Where-Object Path -eq $EfiVhdPath | Select-Object -First 1
@@ -208,7 +249,7 @@ function Initialize-EfiVhd {
         }
         else {
             $partition = Get-Partition -DiskNumber $disk.Number | Where-Object { $_.Type -eq 'Basic' -or $_.FileSystem -eq 'FAT32' } | Select-Object -First 1
-            if ($null -eq $partition) { throw "Não foi encontrada uma partição utilizável no EFI VHDX." }
+            if ($null -eq $partition) { throw 'Não foi encontrada uma partição utilizável no EFI VHDX.' }
             if (-not $partition.DriveLetter) { $partition | Add-PartitionAccessPath -AssignDriveLetter | Out-Null }
             $partition = Get-Partition -DiskNumber $disk.Number | Where-Object { $_.PartitionNumber -eq $partition.PartitionNumber }
             $supported = Get-PartitionSupportedSize -DiskNumber $disk.Number -PartitionNumber $partition.PartitionNumber
@@ -233,8 +274,6 @@ function Initialize-EfiVhd {
             Copy-Item -Path (Join-Path $scriptsSource '*') -Destination (Join-Path $mountRoot 'Scripts') -Recurse -Force
         }
 
-        # This is the critical part missing from the previous version:
-        # Recovery must live beside EFI at the root of the FAT32 boot VHDX.
         $recoverySource = Join-Path $RecoveryPath 'com.apple.recovery.boot'
         if (-not (Test-Path -LiteralPath $recoverySource)) { throw "Recovery não encontrado em $recoverySource." }
         $recoveryTarget = Join-Path $mountRoot 'com.apple.recovery.boot'
@@ -357,7 +396,9 @@ try {
     if ($RebootRequired) { Warn 'Reinicialize o Windows e execute novamente o mesmo comando.'; throw 'Reinicialização necessária para concluir a ativação do Hyper-V.' }
 
     Write-Stage 'Preparando workspace'
-    Test-Directory $RepoPath; Test-Directory $RecoveryPath; Test-Directory $VhdPath
+    Test-Directory $RepoPath
+    Test-Directory $RecoveryPath
+    Test-Directory $VhdPath
     Ok "Workspace pronto em $RootPath"
     Complete-Stage
 
@@ -378,7 +419,8 @@ try {
     Complete-Stage
 
     Write-Stage 'Validando ferramentas'
-    Ok 'OCE-Build/macrecovery será utilizado pelo wrapper upstream.'
+    $macrecoveryPath = Initialize-MacRecoveryTool
+    Ok "macrecovery.py disponível em $macrecoveryPath"
     Complete-Stage
 
     Write-Stage 'Configurando CPU / src/config.yml'
