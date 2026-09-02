@@ -93,11 +93,11 @@ function Assert-Administrator {
     }
 }
 
-function Ensure-Directory([string]$Path) {
+function Test-Directory([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path)) { New-Item -ItemType Directory -Path $Path -Force | Out-Null }
 }
 
-function Command-Exists([string]$Name) { return $null -ne (Get-Command $Name -ErrorAction SilentlyContinue) }
+function Test-Command([string]$Name) { return $null -ne (Get-Command $Name -ErrorAction SilentlyContinue) }
 
 function Get-HyperVFeatureState {
     $output = & dism.exe /Online /Get-FeatureInfo "/FeatureName:Microsoft-Hyper-V-All" 2>&1
@@ -139,7 +139,7 @@ Kernel:
 
 function Invoke-MacRecoveryDownload {
     $recoveryDestination = Join-Path $RecoveryPath 'com.apple.recovery.boot'
-    Ensure-Directory $recoveryDestination
+    Test-Directory $recoveryDestination
 
     $dmg = Get-ChildItem -LiteralPath $recoveryDestination -Filter '*.dmg' -File -ErrorAction SilentlyContinue | Select-Object -First 1
     $chunklist = Get-ChildItem -LiteralPath $recoveryDestination -Filter '*.chunklist' -File -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -167,8 +167,8 @@ function Invoke-MacRecoveryDownload {
     return $recoveryDestination
 }
 
-function Ensure-EfiVhd {
-    Ensure-Directory $VhdPath
+function Initialize-EfiVhd {
+    Test-Directory $VhdPath
     if (-not (Test-Path -LiteralPath $EfiVhdPath)) {
         Run "New-VHD $EfiVhdPath -Dynamic -SizeBytes 5GB"
         New-VHD -Path $EfiVhdPath -Dynamic -SizeBytes $EfiDiskBytes | Out-Null
@@ -218,18 +218,18 @@ function Ensure-EfiVhd {
         $mountRoot = "$($partition.DriveLetter):"
         $efiSource = Join-Path $RepoPath 'dist\EFI'
         if (-not (Test-Path -LiteralPath $efiSource)) { throw "Build concluído, mas dist\EFI não foi encontrado em $RepoPath." }
-        Ensure-Directory (Join-Path $mountRoot 'EFI')
+        Test-Directory (Join-Path $mountRoot 'EFI')
         Copy-Item -Path (Join-Path $efiSource '*') -Destination (Join-Path $mountRoot 'EFI') -Recurse -Force
 
         $toolsSource = Join-Path $RepoPath 'dist\Tools'
         if (Test-Path -LiteralPath $toolsSource) {
-            Ensure-Directory (Join-Path $mountRoot 'Tools')
+            Test-Directory (Join-Path $mountRoot 'Tools')
             Copy-Item -Path (Join-Path $toolsSource '*') -Destination (Join-Path $mountRoot 'Tools') -Recurse -Force
         }
 
         $scriptsSource = Join-Path $RepoPath 'dist\Scripts'
         if (Test-Path -LiteralPath $scriptsSource) {
-            Ensure-Directory (Join-Path $mountRoot 'Scripts')
+            Test-Directory (Join-Path $mountRoot 'Scripts')
             Copy-Item -Path (Join-Path $scriptsSource '*') -Destination (Join-Path $mountRoot 'Scripts') -Recurse -Force
         }
 
@@ -238,7 +238,7 @@ function Ensure-EfiVhd {
         $recoverySource = Join-Path $RecoveryPath 'com.apple.recovery.boot'
         if (-not (Test-Path -LiteralPath $recoverySource)) { throw "Recovery não encontrado em $recoverySource." }
         $recoveryTarget = Join-Path $mountRoot 'com.apple.recovery.boot'
-        Ensure-Directory $recoveryTarget
+        Test-Directory $recoveryTarget
         Copy-Item -Path (Join-Path $recoverySource '*') -Destination $recoveryTarget -Recurse -Force
 
         $files = Get-ChildItem -LiteralPath $recoveryTarget -File
@@ -259,15 +259,15 @@ function Ensure-EfiVhd {
     Optimize-VHD -Path $EfiVhdPath -Mode Full -ErrorAction SilentlyContinue
 }
 
-function Ensure-OsVhd {
-    Ensure-Directory $VhdPath
+function Initialize-OsVhd {
+    Test-Directory $VhdPath
     if (Test-Path -LiteralPath $OsVhdPath) { Ok "Disco da VM já existe: $OsVhdPath"; return }
     Run "New-VHD $OsVhdPath -Dynamic -SizeBytes 160GB"
     New-VHD -Path $OsVhdPath -Dynamic -SizeBytes $OsDiskBytes | Out-Null
     Ok "Disco principal criado: $OsVhdPath"
 }
 
-function Configure-Vm {
+function Initialize-Vm {
     $vm = Get-Vm $VmName
     if ($null -eq $vm) {
         $switch = Get-VMSwitch | Where-Object { $_.SwitchType -eq 'External' } | Select-Object -First 1
@@ -323,7 +323,7 @@ try {
     Write-Host 'OS Disk   : 160 GB dynamic'
     Write-Host 'EFI Disk  : 5 GB dynamic (EFI + macOS Recovery)'
 
-    Ensure-Directory $RootPath
+    Test-Directory $RootPath
     Start-Transcript -Path $LogPath -Append -ErrorAction SilentlyContinue | Out-Null
     $TranscriptStarted = $true
 
@@ -339,8 +339,8 @@ try {
     Step "Threads : $($cpu.NumberOfLogicalProcessors)"
     Step "RAM     : $([math]::Round($os.TotalVisibleMemorySize / 1MB,2)) GB"
     if (-not (Test-Path -LiteralPath "${Drive}:\")) { throw "A unidade ${Drive}: não existe." }
-    if (-not (Command-Exists 'dism.exe')) { throw 'DISM.exe não foi encontrado.' }
-    if (-not (Command-Exists 'git')) { throw 'Git não está disponível no PATH.' }
+    if (-not (Test-Command 'dism.exe')) { throw 'DISM.exe não foi encontrado.' }
+    if (-not (Test-Command 'git')) { throw 'Git não está disponível no PATH.' }
     Ok "Unidade ${Drive}: disponível."
     Ok 'Git e DISM disponíveis.'
     Complete-Stage
@@ -357,7 +357,7 @@ try {
     if ($RebootRequired) { Warn 'Reinicialize o Windows e execute novamente o mesmo comando.'; throw 'Reinicialização necessária para concluir a ativação do Hyper-V.' }
 
     Write-Stage 'Preparando workspace'
-    Ensure-Directory $RepoPath; Ensure-Directory $RecoveryPath; Ensure-Directory $VhdPath
+    Test-Directory $RepoPath; Test-Directory $RecoveryPath; Test-Directory $VhdPath
     Ok "Workspace pronto em $RootPath"
     Complete-Stage
 
@@ -401,15 +401,15 @@ try {
     Complete-Stage
 
     Write-Stage 'Preparando EFI.vhdx (EFI + Recovery)'
-    Ensure-EfiVhd
+    Initialize-EfiVhd
     Complete-Stage
 
     Write-Stage 'Criando disco principal da VM'
-    Ensure-OsVhd
+    Initialize-OsVhd
     Complete-Stage
 
     Write-Stage 'Criando / configurando VM Hyper-V'
-    Configure-Vm
+    Initialize-Vm
     Complete-Stage
 
     if (-not $script:UseAnsiProgress) { Write-Progress -Id 0 -Activity 'OSX-Hyper-V build' -Completed }
